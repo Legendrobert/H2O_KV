@@ -1,0 +1,21 @@
+# SpectraKV 运行环境钉死版本.
+# 关键点: transformers 在 4.40 之后 LlamaAttention 接口大改 (Cache 对象,
+# position_embeddings 外传, past_key_values 复数), H2O 原代码和 SpectraKV
+# 的 SpectraLlamaAttention 都是基于旧版接口写的, 必须用 4.36.x.
+
+torch>=2.0,<2.4
+transformers==4.36.2
+tokenizers>=0.15.0,<0.16.0
+accelerate>=0.25.0,<0.30.0
+sentencepiece>=0.1.99
+protobuf>=3.20,<5.0
+safetensors>=0.4.0
+einops>=0.7.0
+
+# 评测脚本用 (H2O 原 README 列出的)
+lm-eval==0.3.0          # 0.4 之后接口完全变了, run_lm_eval_harness.py 走不通
+datasets>=2.14.0,<2.20.0
+huggingface_hub>=0.20.0,<0.24.0
+
+# 可选: HELM 评测才需要, 不跑 HELM 可以注释掉
+# crfm-helm>=0.4.0
