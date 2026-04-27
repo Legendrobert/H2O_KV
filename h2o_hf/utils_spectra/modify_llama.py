@@ -125,6 +125,11 @@ class SpectraKVCache_LayerWise:
 
         # 标志: 是否已经做过一次性压缩. 一旦为 True 后续 forward 不再介入.
         self.compressed = False
+        # 缓存当前样本算出来的 keep 索引. 一份 keep_idx 同时供:
+        #   1) attention forward 里把非 keep 位置 mask 掉 (lm_eval 单次 forward 看得见压缩效果)
+        #   2) 末尾 gather-based KV cache 压缩 (decode 复用)
+        # 两路共用同一份索引保证 prefill 和 decode 一致.
+        self._keep_idx = None
 
     # ----------------------------------------------------------------------
     # 对外接口: 接受 past_key_values, 返回压缩/未压缩 past_key_values
@@ -163,8 +168,9 @@ class SpectraKVCache_LayerWise:
         return self.__call__(past_key_values, None)
 
     def _clean_scores(self):
-        """每个样本评测完调用, 重置压缩状态."""
+        """每个样本评测完调用, 重置压缩状态和缓存的 keep 索引."""
         self.compressed = False
+        self._keep_idx = None
 
     # ----------------------------------------------------------------------
     # JL sketch 近似 leverage score
@@ -205,11 +211,21 @@ class SpectraKVCache_LayerWise:
         # R = SK^T SK + λI: (H, d, d)
         R = torch.matmul(SK.transpose(1, 2), SK)
         eye = torch.eye(d, device=device, dtype=torch.float32).unsqueeze(0)
-        R = R + self.reg_lambda * eye
 
-        # R 是对称正定 (有 λI 正则后一定正定), 用 Cholesky 求逆最稳
-        L = torch.linalg.cholesky(R)                        # (H, d, d)
-        R_inv = torch.cholesky_inverse(L)                   # (H, d, d)
+        # 自适应 λ: 跟 R 的对角平均同量级, 避免 K 数值大时 reg_lambda 失效.
+        # 某些 Llama head (attention sink) K 行范数极大, R 量级到 1e6+, 固定的
+        # reg_lambda=1e-3 起不到正则化作用, fp32 下噪声就能让 Cholesky 挂.
+        # 这里把 λ 钉到 R 自己的 scale 的某个比例, 不管 K 多大都有效.
+        diag_mean = R.diagonal(dim1=-2, dim2=-1).mean(dim=-1, keepdim=True).unsqueeze(-1)  # (H, 1, 1)
+        lam = (self.reg_lambda * diag_mean).clamp(min=1e-6)
+        R = R + lam * eye
+
+        # 一般情况 Cholesky 即可. 极端病态的 head fallback 到 pinv.
+        try:
+            L = torch.linalg.cholesky(R)                    # (H, d, d)
+            R_inv = torch.cholesky_inverse(L)               # (H, d, d)
+        except torch._C._LinAlgError:
+            R_inv = torch.linalg.pinv(R)
 
         # leverage_i = K_i R^{-1} K_i^T
         # 先 K R^{-1}: (H, N, d)
@@ -220,29 +236,27 @@ class SpectraKVCache_LayerWise:
         return leverage
 
     # ----------------------------------------------------------------------
-    # 根据 leverage score 选择保留行, gather 出压缩的 K/V
+    # 选 keep 行 (sink + top-r + recent), 缓存索引供 mask 和 gather 共用
     # ----------------------------------------------------------------------
     @torch.no_grad()
-    def _compress(self, K: torch.Tensor, V: torch.Tensor):
+    def _compute_keep_idx(self, K: torch.Tensor) -> torch.Tensor:
         """
-        一次性压缩:
-          1. 算 leverage score
-          2. sink + top-r(中间段) + recent 三段合并
-          3. 按原位置排序后 gather K/V (保留 RoPE 内嵌的位置语义)
+        算 leverage score, 选 sink + top-r(中间段) + recent, 返回排好序的索引.
+        缓存到 self._keep_idx, 同一份索引被 attention mask 和 cache gather 共享.
 
-        K, V shape: (1, num_kv_heads, N, head_dim)
-        返回     : (1, num_kv_heads, cache_size, head_dim)
+        K shape: (1, num_kv_heads, N, head_dim)
+        return : (num_kv_heads, L) long, L 通常 = cache_size
         """
+        if self._keep_idx is not None:
+            return self._keep_idx
+
         bsz, num_heads, N, d = K.shape
         device = K.device
 
-        # 算每一行的 leverage score. 只对"中间段"做 top-r, sink 和 recent 强制保留.
         leverage = self._compute_leverage_scores(K)              # (H, N)
 
         middle_start = self.sink_size
         middle_end = N - self.recent_size
-
-        # 边界保护: 极端情况下中间段可能比 hh_size 还短, 此时把能选的都选了
         middle_len = max(middle_end - middle_start, 0)
         k_middle = min(self.hh_size, middle_len)
 
@@ -253,7 +267,6 @@ class SpectraKVCache_LayerWise:
         else:
             topk_global = torch.empty(num_heads, 0, dtype=torch.long, device=device)
 
-        # 强制保留的两端, 每个 head 相同
         sink_idx = (
             torch.arange(self.sink_size, device=device)
             .unsqueeze(0)
@@ -268,10 +281,28 @@ class SpectraKVCache_LayerWise:
         # 合并并按原位置排序: RoPE 已经烤在 K 里, 顺序保原样最安全
         keep_idx = torch.cat([sink_idx, topk_global, recent_idx], dim=-1)  # (H, L)
         keep_idx, _ = keep_idx.sort(dim=-1)
-        L = keep_idx.size(-1)  # 通常 = self.cache_size, 边界情况下可能略小
 
-        # torch.gather: 按每个 head 独立的索引在 dim=2 上取行
-        # K: (1, H, N, d),  索引要 broadcast 成 (1, H, L, d)
+        self._keep_idx = keep_idx
+        return keep_idx
+
+    # ----------------------------------------------------------------------
+    # 用缓存好的 keep_idx gather 出压缩的 K/V (decode 复用用)
+    # ----------------------------------------------------------------------
+    @torch.no_grad()
+    def _compress(self, K: torch.Tensor, V: torch.Tensor):
+        """
+        一次性压缩:
+          1. _compute_keep_idx (若已缓存直接复用, 跟 attention mask 同源)
+          2. 按原位置排序后 gather K/V (保留 RoPE 内嵌的位置语义)
+
+        K, V shape: (1, num_kv_heads, N, head_dim)
+        返回     : (1, num_kv_heads, cache_size, head_dim)
+        """
+        bsz, num_heads, N, d = K.shape
+
+        keep_idx = self._compute_keep_idx(K)                     # (H, L)
+        L = keep_idx.size(-1)
+
         idx_expand = keep_idx.unsqueeze(0).unsqueeze(-1).expand(bsz, num_heads, L, d)
         K_compressed = torch.gather(K, dim=2, index=idx_expand)
         V_compressed = torch.gather(V, dim=2, index=idx_expand)
@@ -368,6 +399,14 @@ class SpectraLlamaAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
+        # ---- 新样本起点重置 cache 状态 ----
+        # lm_eval harness 每个样本各调一次 forward (past_key_value=None 起步).
+        # 不重置的话 self.compressed 会从上一个样本残留为 True, 导致这个样本的 attention
+        # mask 不会激活, logprobs 还是无压缩的结果. 真 decode 场景 past_key_value 不为 None,
+        # 不会进这个分支, one-shot 语义保留.
+        if past_key_value is None:
+            self.kv_cache._clean_scores()
+
         # ---- QKV 投影 ----
         # 注: pretraining_tp>1 的情况不进入我们的使用场景 (Llama-2-7b 单卡), 省略分片路径
         query_states = self.q_proj(hidden_states)
@@ -419,6 +458,28 @@ class SpectraLlamaAttention(nn.Module):
         # use_cache=True 时, 这是"当前步看到的完整 KV", 稍后喂给 SpectraKV 压缩器
         past_key_value = (key_states, value_states) if use_cache else None
 
+        # ---- 计算 spectral keep mask, 让压缩对当前 forward 的 logprobs 也生效 ----
+        # 关键: 单次 forward 评测 (lm_eval) 没有 decode 步, 单纯把 past_key_value 压缩
+        # 不会影响这一步 attention 的输出. 必须在 softmax 之前把非 keep 位置 mask 掉,
+        # 才能让 SpectraKV 真的影响 logprobs (跟 H2O utils_lm_eval 的 mask 路径一致).
+        # 同一份 keep_idx 后面也供 gather-based cache 压缩用, 保证两路一致.
+        spec_mask = None
+        if not self.kv_cache.compressed and kv_seq_len > self.kv_cache.cache_size:
+            keep_idx = self.kv_cache._compute_keep_idx(key_states)              # (num_kv_heads, L)
+            keep_bool = torch.zeros(
+                self.num_key_value_heads, kv_seq_len,
+                dtype=torch.bool, device=key_states.device,
+            )
+            keep_bool.scatter_(1, keep_idx, True)
+            # GQA 展开成 num_heads
+            keep_bool = keep_bool.repeat_interleave(self.num_key_value_groups, dim=0)  # (num_heads, kv_seq_len)
+            mask_min = torch.finfo(query_states.dtype).min
+            spec_mask = torch.zeros(
+                bsz, self.num_heads, 1, kv_seq_len,
+                dtype=query_states.dtype, device=key_states.device,
+            )
+            spec_mask.masked_fill_(~keep_bool.unsqueeze(0).unsqueeze(2), mask_min)
+
         # ---- GQA: 把 kv_head 重复到 num_heads ----
         key_states_rep = repeat_kv(key_states, self.num_key_value_groups)
         value_states_rep = repeat_kv(value_states, self.num_key_value_groups)
@@ -442,13 +503,16 @@ class SpectraLlamaAttention(nn.Module):
                 )
             attn_weights = attn_weights + attention_mask
 
+        # spectral keep mask: 把不被保留的 token 推到 -inf, softmax 后权重为 0
+        if spec_mask is not None:
+            attn_weights = attn_weights + spec_mask
+
         attn_weights = nn.functional.softmax(
             attn_weights, dim=-1, dtype=torch.float32
         ).to(query_states.dtype)
 
-        # ---- SpectraKV 一次性压缩入口 ----
-        # 注意: 传 None 不传 attn_weights (谱方法不需要 query 信息)
-        # 压缩器内部有 self.compressed 标志, 第一次超预算压一次, 后续 no-op.
+        # ---- SpectraKV 一次性 gather 压缩 (供 decode 复用; lm_eval 单 forward 用不到) ----
+        # 此处会调用同一份缓存的 keep_idx, 不会重新算 leverage. 一致性由 _keep_idx 保证.
         past_key_value = self.kv_cache(past_key_value, None)
 
         # ---- 输出投影 ----
