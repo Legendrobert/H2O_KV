@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=spectrakv-eval
 #SBATCH --account=aip-lenck
-#SBATCH --partition=gpubase_h100_b1
-#SBATCH --time=04:00:00
+#SBATCH --partition=gpubase_h100_b2
+#SBATCH --time=10:00:00
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:1
@@ -50,6 +50,7 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_HOME="${SCRATCH}/hf_cache"
 export TRANSFORMERS_CACHE="${SCRATCH}/hf_cache"
+export MODEL_NAME="${MODEL}"
 
 cd "${SLURM_SUBMIT_DIR}"
 
