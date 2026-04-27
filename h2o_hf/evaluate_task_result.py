@@ -24,16 +24,19 @@ if __name__ == '__main__':
     parser.add_argument('--num-fewshot', type=int, default=0)
     args = parser.parse_args()
     
-    if args.model_type == 'opt':
-        os.environ['MODEL_NAME'] = "facebook/opt-66b"
-    elif args.model_type == 'bloom':
-        os.environ['MODEL_NAME'] = "bigscience/bloom"
-    elif args.model_type == 'gpt_neox':
-        os.environ['MODEL_NAME'] = "EleutherAI/gpt-neox-20b"
-    elif args.model_type == 'llama':
-        os.environ['MODEL_NAME'] = "huggyllama/llama-7b"
-    else:
-        assert False
+    # 如果环境已经设了 MODEL_NAME (slurm 里指本地路径), 就尊重它, 不去联网拿 hub 仓库.
+    # 没设的话回退到 H2O 原默认值 (在线环境跑才用得到).
+    if 'MODEL_NAME' not in os.environ:
+        if args.model_type == 'opt':
+            os.environ['MODEL_NAME'] = "facebook/opt-66b"
+        elif args.model_type == 'bloom':
+            os.environ['MODEL_NAME'] = "bigscience/bloom"
+        elif args.model_type == 'gpt_neox':
+            os.environ['MODEL_NAME'] = "EleutherAI/gpt-neox-20b"
+        elif args.model_type == 'llama':
+            os.environ['MODEL_NAME'] = "huggyllama/llama-7b"
+        else:
+            assert False
 
     seq = 1024
     total_batch = 1

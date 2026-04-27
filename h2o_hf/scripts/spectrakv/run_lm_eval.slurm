@@ -50,6 +50,9 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_HOME="${SCRATCH}/hf_cache"
 export TRANSFORMERS_CACHE="${SCRATCH}/hf_cache"
+
+# tasks/eval_harness.py 通过这个环境变量找 tokenizer (默认值 facebook/opt-1.3b 会触发联网下载).
+# 必须设到本地模型路径, 否则 generate_task_data.py 在离线节点崩.
 export MODEL_NAME="${MODEL}"
 
 cd "${SLURM_SUBMIT_DIR}"
