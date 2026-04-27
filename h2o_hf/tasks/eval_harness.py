@@ -29,6 +29,9 @@ def process_init():
     else:
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         tokenizer.add_bos_token = False
+        if getattr(tokenizer, "pad_token_id", None) is None:
+            tokenizer.pad_token_id = getattr(tokenizer, "eos_token_id", 0)
+            tokenizer.pad_token = getattr(tokenizer, "eos_token", "<|endoftext|>")
 
 def process_request(x, seq):
     global tokenizer

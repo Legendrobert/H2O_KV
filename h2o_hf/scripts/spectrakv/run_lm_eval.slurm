@@ -6,8 +6,8 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:1
-#SBATCH --output=%x-%j.out
-#SBATCH --error=%x-%j.err
+#SBATCH --output=result/%x-%j.out
+#SBATCH --error=result/%x-%j.err
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=592730248@qq.com
 
@@ -78,15 +78,15 @@ python -u generate_task_data.py \
     --task-name "${TASK}" \
     --num-fewshot "${SHOTS}"
 
-echo "==> Step 2: inference (model_type=${MODEL_TYPE}, h_ratio=0.1, r_ratio=0.1)"
+echo "==> Step 2: inference (model_type=${MODEL_TYPE}, h_ratio=0.02, r_ratio=0.02)"
 python -u run_lm_eval_harness.py \
     --input-path "${INPUT}" \
     --output-path "${OUTPUT}" \
     --model-name "${MODEL}" \
     --model-type "${MODEL_TYPE}" \
     --enable_small_cache \
-    --heavy_ratio 0.1 \
-    --recent_ratio 0.1
+    --heavy_ratio 0.02 \
+    --recent_ratio 0.02
 
 echo "==> Step 3: evaluate"
 python -u evaluate_task_result.py \

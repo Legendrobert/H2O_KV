@@ -7,7 +7,7 @@ import copy
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
 from utils_lm_eval.modify_llama import convert_kvcache_llama_heavy_recent, LlamaAttention_heavy_hitter
-from utils_lm_eval.modify_gptneox import convert_kvcache_gpt_neox_heavy_recent, GPTNeoXAttention_Mask
+#from utils_lm_eval.modify_gptneox import convert_kvcache_gpt_neox_heavy_recent, GPTNeoXAttention_Mask
 from utils_lm_eval.modify_opt import convert_kvcache_opt_heavy_recent, OPTAttention_Mask
 from utils_spectra import convert_kvcache_llama_spectra
 
@@ -15,7 +15,7 @@ from utils_spectra import convert_kvcache_llama_spectra
 ENABLE_Heavy_Hitter_FUNCTIONS = {
     "llama": convert_kvcache_llama_heavy_recent,
     "opt": convert_kvcache_opt_heavy_recent,
-    "gpt_neox": convert_kvcache_gpt_neox_heavy_recent,
+    # "gpt_neox": convert_kvcache_gpt_neox_heavy_recent,
     # SpectraKV: 一次性谱压缩 (leverage score). 和 H2O 共用 heavy/recent 比率接口,
     # 额外吃 --sink_size / --jl_dim_multiplier.
     "spectra": convert_kvcache_llama_spectra,

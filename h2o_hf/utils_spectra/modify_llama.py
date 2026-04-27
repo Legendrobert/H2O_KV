@@ -276,6 +276,8 @@ class SpectraKVCache_LayerWise:
         K_compressed = torch.gather(K, dim=2, index=idx_expand)
         V_compressed = torch.gather(V, dim=2, index=idx_expand)
 
+        print(f"[SpectraKV] Triggered compression! Compressed from length {N} to {L}.", flush=True)
+
         return K_compressed, V_compressed
 
 
