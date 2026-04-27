@@ -91,8 +91,10 @@ class SpectraKVCache_LayerWise:
 
     def __init__(
         self,
-        hh_size: int = 128,
-        recent_size: int = 32,
+        heavy_ratio: Optional[float] = None,
+        recent_ratio: Optional[float] = None,
+        hh_size: Optional[int] = None,
+        recent_size: Optional[int] = None,
         sink_size: int = 4,
         jl_dim_multiplier: int = 4,
         reg_lambda: float = 1e-3,
@@ -100,22 +102,46 @@ class SpectraKVCache_LayerWise:
         v_seq_dim: int = 2,
     ):
         """
+        两种 budget 模式 (任选其一, 显式绝对值优先):
+          ratio 模式 (推荐, 跟 H2O 语义对齐):
+              heavy_ratio + recent_ratio, budget = int(ratio * 当前 prompt 长度)
+              cache_size 是 per-prompt 动态量, h_ratio=0.02 的"压缩程度"和 H2O 一致
+          绝对模式 (deploy 固定预算 / smoke test 用):
+              hh_size + recent_size, 静态预算
+
         Args:
-            hh_size: leverage-score 选出的中间段 token 数
-            recent_size: 尾部强制保留窗口大小
-            sink_size: 开头强制保留的 sink token 数 (StreamingLLM 发现的现象, 一般 4)
+            heavy_ratio:    leverage top-r 的 budget 占当前 prompt 长度的比例
+            recent_ratio:   recent 窗口占当前 prompt 长度的比例
+            hh_size:        显式绝对值, 给了就覆盖 heavy_ratio
+            recent_size:    显式绝对值, 给了就覆盖 recent_ratio
+            sink_size:      开头强制保留的 sink token 数 (StreamingLLM, 一般 4)
             jl_dim_multiplier: JL sketch 维度 m = jl_dim_multiplier * head_dim
-                               理论上 m = Θ(d log d) 足够, 4*d 在实际中稳健
-            reg_lambda: R = (SK)^T(SK) 求逆前加的 λI 正则, 防病态
+            reg_lambda:     R = (SK)^T(SK) 求逆前加的 λI 正则
             k_seq_dim / v_seq_dim: K/V 张量里 "序列长度" 所在的维度
         """
-        print(
-            f"SpectraKVCache-LayerWise: sink={sink_size}, hh(top-r)={hh_size}, recent={recent_size}"
-        )
-        self.hh_size = hh_size
-        self.recent_size = recent_size
+        if hh_size is None and heavy_ratio is None:
+            raise ValueError("SpectraKVCache 至少要指定 heavy_ratio 或 hh_size 中的一个")
+        if recent_size is None and recent_ratio is None:
+            raise ValueError("SpectraKVCache 至少要指定 recent_ratio 或 recent_size 中的一个")
+
+        # 绝对模式优先
+        self.hh_size_abs = hh_size
+        self.recent_size_abs = recent_size
+        self.heavy_ratio = heavy_ratio
+        self.recent_ratio = recent_ratio
         self.sink_size = sink_size
-        self.cache_size = sink_size + hh_size + recent_size
+
+        if hh_size is not None and recent_size is not None:
+            print(
+                f"SpectraKVCache-LayerWise (absolute): sink={sink_size}, "
+                f"hh(top-r)={hh_size}, recent={recent_size}"
+            )
+        else:
+            print(
+                f"SpectraKVCache-LayerWise (ratio): sink={sink_size}, "
+                f"h_ratio={heavy_ratio}, r_ratio={recent_ratio}  "
+                f"(per-prompt: budget = ratio × seq_len)"
+            )
 
         self.jl_dim_multiplier = jl_dim_multiplier
         self.reg_lambda = reg_lambda
@@ -130,6 +156,35 @@ class SpectraKVCache_LayerWise:
         #   2) 末尾 gather-based KV cache 压缩 (decode 复用)
         # 两路共用同一份索引保证 prefill 和 decode 一致.
         self._keep_idx = None
+
+    # ----------------------------------------------------------------------
+    # Per-prompt budget 解析: 当前 N → (hh_size, recent_size, cache_size)
+    # ----------------------------------------------------------------------
+    def _resolve_sizes(self, N: int):
+        """根据当前 prompt 长度 N 返回 (hh_size, recent_size). 绝对模式直接返回固定值."""
+        if self.hh_size_abs is not None:
+            hh = self.hh_size_abs
+        else:
+            hh = max(int(self.heavy_ratio * N), 1)
+        if self.recent_size_abs is not None:
+            recent = self.recent_size_abs
+        else:
+            recent = max(int(self.recent_ratio * N), 1)
+        return hh, recent
+
+    def _resolve_cache_size(self, N: int) -> int:
+        hh, recent = self._resolve_sizes(N)
+        return self.sink_size + hh + recent
+
+    @property
+    def cache_size(self):
+        """绝对模式下的静态 cache_size. ratio 模式下用 _resolve_cache_size(N)."""
+        if self.hh_size_abs is None or self.recent_size_abs is None:
+            raise AttributeError(
+                "cache_size 在 ratio 模式下是 per-prompt 动态量, "
+                "请用 _resolve_cache_size(N) 而不是 .cache_size"
+            )
+        return self.sink_size + self.hh_size_abs + self.recent_size_abs
 
     # ----------------------------------------------------------------------
     # 对外接口: 接受 past_key_values, 返回压缩/未压缩 past_key_values
@@ -151,8 +206,8 @@ class SpectraKVCache_LayerWise:
 
         seq_len = past_key_values[0].size(self.k_seq_dim)
 
-        # 还没超预算: 不做事 (对应短 prefill 的情况)
-        if seq_len <= self.cache_size:
+        # 还没超 (per-prompt) 预算: 不做事
+        if seq_len <= self._resolve_cache_size(seq_len):
             return past_key_values
 
         # 执行一次性压缩
@@ -253,12 +308,15 @@ class SpectraKVCache_LayerWise:
         bsz, num_heads, N, d = K.shape
         device = K.device
 
+        # per-prompt 动态预算: ratio × N 或绝对值
+        hh_size, recent_size = self._resolve_sizes(N)
+
         leverage = self._compute_leverage_scores(K)              # (H, N)
 
         middle_start = self.sink_size
-        middle_end = N - self.recent_size
+        middle_end = N - recent_size
         middle_len = max(middle_end - middle_start, 0)
-        k_middle = min(self.hh_size, middle_len)
+        k_middle = min(hh_size, middle_len)
 
         if k_middle > 0:
             middle_leverage = leverage[:, middle_start:middle_end]
@@ -273,7 +331,7 @@ class SpectraKVCache_LayerWise:
             .expand(num_heads, -1)
         )
         recent_idx = (
-            torch.arange(N - self.recent_size, N, device=device)
+            torch.arange(N - recent_size, N, device=device)
             .unsqueeze(0)
             .expand(num_heads, -1)
         )
@@ -347,10 +405,13 @@ class SpectraLlamaAttention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self._init_rope()
 
-        # 从 config 读 SpectraKV 专属参数, 带缺省值方便和老 config 兼容
+        # 从 config 读 SpectraKV 专属参数: ratio (per-prompt, 推荐) 优先,
+        # 也兼容显式绝对值. SpectraKVCache_LayerWise 内部解析两种模式.
         self.kv_cache = SpectraKVCache_LayerWise(
-            hh_size=config.hh_size,
-            recent_size=config.recent_size,
+            heavy_ratio=getattr(config, "heavy_ratio", None),
+            recent_ratio=getattr(config, "recent_ratio", None),
+            hh_size=getattr(config, "hh_size", None),
+            recent_size=getattr(config, "recent_size", None),
             sink_size=getattr(config, "sink_size", 4),
             jl_dim_multiplier=getattr(config, "jl_dim_multiplier", 4),
             reg_lambda=getattr(config, "reg_lambda", 1e-3),
@@ -464,7 +525,7 @@ class SpectraLlamaAttention(nn.Module):
         # 才能让 SpectraKV 真的影响 logprobs (跟 H2O utils_lm_eval 的 mask 路径一致).
         # 同一份 keep_idx 后面也供 gather-based cache 压缩用, 保证两路一致.
         spec_mask = None
-        if not self.kv_cache.compressed and kv_seq_len > self.kv_cache.cache_size:
+        if not self.kv_cache.compressed and kv_seq_len > self.kv_cache._resolve_cache_size(kv_seq_len):
             keep_idx = self.kv_cache._compute_keep_idx(key_states)              # (num_kv_heads, L)
             keep_bool = torch.zeros(
                 self.num_key_value_heads, kv_seq_len,
@@ -559,25 +620,12 @@ class SpectraLlamaForCausalLM(LlamaForCausalLM):
 # ==========================================================================
 def _resolve_spectra_budgets(config):
     """
-    统一 "ratio vs. absolute size" 两种配置来源:
-      - 优先用 config.hh_size / config.recent_size (如果显式设置了)
-      - 否则用 config.heavy_ratio / config.recent_ratio × max_position_embeddings
-    sink_size 取 config.sink_size, 默认 4.
-    把结果写回 config, 方便 SpectraLlamaAttention 直接读.
+    SpectraLlamaAttention 直接消费 config.heavy_ratio / config.recent_ratio (per-prompt
+    动态 budget, 跟 H2O 语义对齐), 或 config.hh_size / config.recent_size (绝对值, 优先).
+    本函数只补 sink_size 默认值, 不再把 ratio 静态展开成绝对值.
     """
-    base_len = getattr(config, "max_position_embeddings", 4096)
-
-    if not hasattr(config, "hh_size") or config.hh_size is None:
-        ratio = getattr(config, "heavy_ratio", 0.1)
-        config.hh_size = max(int(ratio * base_len), 1)
-
-    if not hasattr(config, "recent_size") or config.recent_size is None:
-        ratio = getattr(config, "recent_ratio", 0.1)
-        config.recent_size = max(int(ratio * base_len), 1)
-
     if not hasattr(config, "sink_size") or config.sink_size is None:
         config.sink_size = 4
-
     return config
 
 
