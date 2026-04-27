@@ -520,26 +520,41 @@ class SpectraLlamaAttention(nn.Module):
         past_key_value = (key_states, value_states) if use_cache else None
 
         # ---- 计算 spectral keep mask, 让压缩对当前 forward 的 logprobs 也生效 ----
-        # 关键: 单次 forward 评测 (lm_eval) 没有 decode 步, 单纯把 past_key_value 压缩
-        # 不会影响这一步 attention 的输出. 必须在 softmax 之前把非 keep 位置 mask 掉,
-        # 才能让 SpectraKV 真的影响 logprobs (跟 H2O utils_lm_eval 的 mask 路径一致).
-        # 同一份 keep_idx 后面也供 gather-based cache 压缩用, 保证两路一致.
+        # 单次 forward 评测 (lm_eval) 里, 单纯压缩 past_key_value 不会影响这一步 attention
+        # 的输出, 必须在 softmax 之前把非 keep 位置 mask 掉.
+        #
+        # Mask 构造仿 H2O (utils_lm_eval/modify_llama.py:161-164):
+        #   final_keep[q, k] = (k ∈ 全局 keep_idx)  ∨  (|q - k| ≤ recent_size)
+        # 第二项 = per-query rolling 带, 对每个 query 位置都把它周围 ±recent_size 个 key 放进来.
+        # 早期 query 不再因为全局 keep_idx 全在中后段而只能看 sink, 单调性才能恢复.
         spec_mask = None
         if not self.kv_cache.compressed and kv_seq_len > self.kv_cache._resolve_cache_size(kv_seq_len):
             keep_idx = self.kv_cache._compute_keep_idx(key_states)              # (num_kv_heads, L)
+
+            # 全局 keep set: sink + leverage top-r + tail recent. 跨 q 广播.
             keep_bool = torch.zeros(
                 self.num_key_value_heads, kv_seq_len,
                 dtype=torch.bool, device=key_states.device,
             )
             keep_bool.scatter_(1, keep_idx, True)
-            # GQA 展开成 num_heads
             keep_bool = keep_bool.repeat_interleave(self.num_key_value_groups, dim=0)  # (num_heads, kv_seq_len)
+            keep_q_broadcast = keep_bool.unsqueeze(0).unsqueeze(2)              # (1, H, 1, kv_seq_len)
+
+            # Per-query rolling recent 带: |q - k| ≤ recent_size.
+            # causal mask 后续单独加, 这里允许 q + recent_size 内的"未来"也无所谓 (会被 causal 吃掉).
+            _, recent_size = self.kv_cache._resolve_sizes(kv_seq_len)
+            rolling = torch.ones(q_len, kv_seq_len, dtype=torch.bool, device=key_states.device)
+            rolling = torch.tril(rolling, diagonal=recent_size)
+            rolling = torch.triu(rolling, diagonal=-recent_size)
+            rolling = rolling.unsqueeze(0).unsqueeze(0)                          # (1, 1, q_len, kv_seq_len)
+
+            final_keep = keep_q_broadcast | rolling                              # broadcast 到 (1, H, q_len, kv_seq_len)
             mask_min = torch.finfo(query_states.dtype).min
             spec_mask = torch.zeros(
-                bsz, self.num_heads, 1, kv_seq_len,
+                bsz, self.num_heads, q_len, kv_seq_len,
                 dtype=query_states.dtype, device=key_states.device,
             )
-            spec_mask.masked_fill_(~keep_bool.unsqueeze(0).unsqueeze(2), mask_min)
+            spec_mask.masked_fill_(~final_keep, mask_min)
 
         # ---- GQA: 把 kv_head 重复到 num_heads ----
         key_states_rep = repeat_kv(key_states, self.num_key_value_groups)
