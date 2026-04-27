@@ -11,12 +11,12 @@ set -euo pipefail
 VENV_DIR="${SCRATCH}/envs/spectrakv"
 REQ_FILE="$(dirname "$0")/../../requirements_spectrakv.txt"
 
-echo "==> 加载 CC 模块"
-# CC 上 python 3.10 + cuda 12.1 是当前 H2O / transformers 4.36 兼容性最好的组合
+echo "==> 加载 Killarney 模块"
+# Killarney 上 python/3.11.5 + cuda/12.6 是默认组合 (和 memory 里登记一致)
 module --force purge
 module load StdEnv/2023
-module load python/3.10
-module load cuda/12.1
+module load python/3.11.5
+module load cuda/12.6
 module load arrow/14.0.1   # datasets / pyarrow 依赖, CC 必须用模块版
 
 echo "==> 创建 venv: ${VENV_DIR}"

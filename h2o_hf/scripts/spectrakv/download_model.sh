@@ -1,23 +1,33 @@
 #!/bin/bash
-# 在 CC 登录节点跑, 把 HuggingFace 模型下到 $SCRATCH/hf_cache.
+# 在 Killarney 登录节点跑, 把 HuggingFace 模型下到 $SCRATCH/hf_cache.
 # 计算节点无外网, 必须事先在登录节点下完整.
 #
+# 提示:
+#   Llama-2-7b 已经有共享副本: ~/projects/aip-lenck/shared/models/Llama-2-7b-hf
+#   主线实验直接用它, 不需要跑这个脚本. 本脚本留给非 Llama-2-7b 的模型.
+#
 # 用法:
+#   bash scripts/spectrakv/download_model.sh meta-llama/Llama-2-7b-hf   # 除非你想自己下一份, 否则用共享的
 #   bash scripts/spectrakv/download_model.sh huggyllama/llama-7b
-#   bash scripts/spectrakv/download_model.sh meta-llama/Llama-2-7b-hf
 #
 # 注意:
 #   - 7B fp16 ~14GB, 下载 5-15 分钟.
 #   - 登录节点不允许跑长任务, 但下载属于 IO 任务一般不会被 kill.
-#     如果 timeout, 改成 salloc 一个 1 GPU 节点 (有外网) 再下: 不对,
-#     CC 的 GPU 计算节点没外网. 真要 timeout, 用 datatransfer node:
-#     ssh dtn1.cedar.computecanada.ca, 然后再跑这个脚本.
+#     真要 timeout, 用 Killarney 的 datatransfer node.
 
 set -euo pipefail
 
-MODEL="${1:-huggyllama/llama-7b}"
+MODEL="${1:-meta-llama/Llama-2-7b-hf}"
 HF_CACHE="${SCRATCH}/hf_cache"
 VENV_DIR="${SCRATCH}/envs/spectrakv"
+
+# 共享 Llama-2-7b 提醒
+if [[ "${MODEL}" == "meta-llama/Llama-2-7b-hf" ]]; then
+    echo "提示: Llama-2-7b 已经有共享副本:"
+    echo "  ~/projects/aip-lenck/shared/models/Llama-2-7b-hf"
+    echo "评测脚本直接指向该路径即可, 省配额."
+    echo ""
+fi
 
 echo "==> 模型: ${MODEL}"
 echo "==> 缓存目录: ${HF_CACHE}"
@@ -29,7 +39,7 @@ export HF_HUB_DOWNLOAD_TIMEOUT=120
 
 # 加载 venv (依赖 huggingface_hub)
 module --force purge
-module load StdEnv/2023 python/3.10
+module load StdEnv/2023 python/3.11.5
 # shellcheck disable=SC1091
 source "${VENV_DIR}/bin/activate"
 

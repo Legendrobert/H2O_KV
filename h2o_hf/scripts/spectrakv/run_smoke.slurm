@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=spectrakv-smoke
-#SBATCH --account=def-YOUR_PI
+#SBATCH --account=aip-lenck
 #SBATCH --time=00:15:00
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=4G
@@ -21,7 +21,7 @@ echo "==> CWD: $(pwd)"
 VENV_DIR="${SCRATCH}/envs/spectrakv"
 
 module --force purge
-module load StdEnv/2023 python/3.10
+module load StdEnv/2023 python/3.11.5
 # shellcheck disable=SC1091
 source "${VENV_DIR}/bin/activate"
 

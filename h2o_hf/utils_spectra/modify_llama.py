@@ -66,6 +66,7 @@ __all__ = [
     "SpectraKVCache_LayerWise",
     "SpectraLlamaAttention",
     "SpectraLlamaForCausalLM",
+    "convert_kvcache_llama_spectra",
 ]
 
 
@@ -484,3 +485,52 @@ class SpectraLlamaForCausalLM(LlamaForCausalLM):
         num_layers = len(self.model.layers)
         for layer_idx in range(num_layers):
             self.model.layers[layer_idx].self_attn = SpectraLlamaAttention(config)
+
+
+# ==========================================================================
+# In-place patcher: 给 run_lm_eval_harness.py 用的, 接口对齐
+# convert_kvcache_llama_heavy_recent
+# ==========================================================================
+def _resolve_spectra_budgets(config):
+    """
+    统一 "ratio vs. absolute size" 两种配置来源:
+      - 优先用 config.hh_size / config.recent_size (如果显式设置了)
+      - 否则用 config.heavy_ratio / config.recent_ratio × max_position_embeddings
+    sink_size 取 config.sink_size, 默认 4.
+    把结果写回 config, 方便 SpectraLlamaAttention 直接读.
+    """
+    base_len = getattr(config, "max_position_embeddings", 4096)
+
+    if not hasattr(config, "hh_size") or config.hh_size is None:
+        ratio = getattr(config, "heavy_ratio", 0.1)
+        config.hh_size = max(int(ratio * base_len), 1)
+
+    if not hasattr(config, "recent_size") or config.recent_size is None:
+        ratio = getattr(config, "recent_ratio", 0.1)
+        config.recent_size = max(int(ratio * base_len), 1)
+
+    if not hasattr(config, "sink_size") or config.sink_size is None:
+        config.sink_size = 4
+
+    return config
+
+
+def convert_kvcache_llama_spectra(model, config):
+    """
+    递归把 model 里所有 LlamaAttention 替换成 SpectraLlamaAttention.
+
+    用法同 utils_lm_eval.convert_kvcache_llama_heavy_recent:
+        model = AutoModelForCausalLM.from_pretrained(...)
+        ckpt = copy.deepcopy(model.state_dict())
+        model = convert_kvcache_llama_spectra(model, config)
+        model.load_state_dict(ckpt)   # 权重名对齐, 可无损回填
+
+    config 上会被自动补上 hh_size / recent_size / sink_size (见 _resolve_spectra_budgets).
+    """
+    config = _resolve_spectra_budgets(config)
+    for name, module in reversed(model._modules.items()):
+        if len(list(module.children())) > 0:
+            model._modules[name] = convert_kvcache_llama_spectra(module, config)
+        if isinstance(module, LlamaAttention):
+            model._modules[name] = SpectraLlamaAttention(config)
+    return model

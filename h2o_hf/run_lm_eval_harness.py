@@ -9,12 +9,16 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from utils_lm_eval.modify_llama import convert_kvcache_llama_heavy_recent, LlamaAttention_heavy_hitter
 from utils_lm_eval.modify_gptneox import convert_kvcache_gpt_neox_heavy_recent, GPTNeoXAttention_Mask
 from utils_lm_eval.modify_opt import convert_kvcache_opt_heavy_recent, OPTAttention_Mask
+from utils_spectra import convert_kvcache_llama_spectra
 
 
 ENABLE_Heavy_Hitter_FUNCTIONS = {
     "llama": convert_kvcache_llama_heavy_recent,
     "opt": convert_kvcache_opt_heavy_recent,
     "gpt_neox": convert_kvcache_gpt_neox_heavy_recent,
+    # SpectraKV: 一次性谱压缩 (leverage score). 和 H2O 共用 heavy/recent 比率接口,
+    # 额外吃 --sink_size / --jl_dim_multiplier.
+    "spectra": convert_kvcache_llama_spectra,
 }
 
 if __name__ == '__main__':
@@ -33,6 +37,11 @@ if __name__ == '__main__':
 
     parser.add_argument("--heavy_ratio", type=float, default=0.1)
     parser.add_argument("--recent_ratio", type=float, default=0.1)
+    # SpectraKV-only. 对其他 model-type 无影响.
+    parser.add_argument("--sink_size", type=int, default=4,
+                        help="SpectraKV: 开头强制保留的 sink token 数")
+    parser.add_argument("--jl_dim_multiplier", type=int, default=4,
+                        help="SpectraKV: JL sketch 维度 = jl_dim_multiplier * head_dim")
     args = parser.parse_args()
 
     input_path = args.input_path
@@ -47,6 +56,11 @@ if __name__ == '__main__':
         print('Enable Small Cache Size')
         config.heavy_ratio = args.heavy_ratio
         config.recent_ratio = args.recent_ratio
+        if args.model_type == "spectra":
+            # SpectraKV 额外参数. convert 函数里会把 ratio × max_position_embeddings
+            # 解成绝对的 hh_size / recent_size.
+            config.sink_size = args.sink_size
+            config.jl_dim_multiplier = args.jl_dim_multiplier
         checkpoint = copy.deepcopy(model.state_dict())
         model = ENABLE_Heavy_Hitter_FUNCTIONS[args.model_type](model, config)
         model.load_state_dict(checkpoint)
