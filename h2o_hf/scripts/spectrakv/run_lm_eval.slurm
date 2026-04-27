@@ -1,13 +1,15 @@
 #!/bin/bash
 #SBATCH --job-name=spectrakv-eval
 #SBATCH --account=aip-lenck
-#SBATCH --partition=gpubase_l40s_b1
+#SBATCH --partition=gpubase_h100_b1
 #SBATCH --time=04:00:00
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
+#SBATCH --mem=64G
 #SBATCH --gres=gpu:1
 #SBATCH --output=%x-%j.out
 #SBATCH --error=%x-%j.err
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=592730248@qq.com
 
 # 真实评测: 跑 H2O lm_eval pipeline, 支持 H2O / SpectraKV 切换.
 # 默认模型 type = spectra (走 SpectraLlamaForCausalLM),
@@ -27,7 +29,7 @@
 set -euo pipefail
 
 TASK="${1:?usage: sbatch run_lm_eval.slurm <task> [<model> <model_arch> <model_type>]}"
-MODEL="${2:-${HOME}/projects/aip-lenck/shared/models/Llama-2-7b-hf}"
+MODEL="${2:-/project/aip-lenck/shared/models/Llama-2-7b-hf}"
 MODEL_ARCH="${3:-llama}"
 MODEL_TYPE="${4:-spectra}"
 SHOTS=5
@@ -37,10 +39,10 @@ echo "==> task=${TASK} model=${MODEL} arch=${MODEL_ARCH} type=${MODEL_TYPE} shot
 echo "==> CWD: $(pwd)"
 nvidia-smi || echo "nvidia-smi 不可用 (CPU 节点?)"
 
-VENV_DIR="${SCRATCH}/envs/spectrakv"
+VENV_DIR="/home/w1996246/projects/aip-lenck/w1996246/spectrakv_env"
 
 module --force purge
-module load StdEnv/2023 python/3.11.5 cuda/12.6
+module load StdEnv/2023 gcc/12.3 arrow/21.0.0 python/3.11.5 cuda/12.6
 # shellcheck disable=SC1091
 source "${VENV_DIR}/bin/activate"
 
