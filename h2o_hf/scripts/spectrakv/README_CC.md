@@ -37,11 +37,13 @@ sbatch scripts/spectrakv/run_lm_eval.slurm openbookqa \
 
 | 变量 | 含义 | 值 |
 |---|---|---|
-| `~/projects/aip-lenck/${USER}` | 代码 + venv (有备份) | 项目空间 |
-| `$SCRATCH` | 数据集 + HF cache + 日志 (无备份, 60 天清理) | Killarney 自带 |
-| `~/projects/aip-lenck/shared/models/Llama-2-7b-hf` | 共享 Llama-2-7b, 省配额 | 共享模型目录 |
+| 代码 | 项目空间 (有备份) | `~/projects/aip-lenck/${USER}/H2O_KV` |
+| venv | 项目空间 (有备份, 不放 $SCRATCH 因为 60 天清理) | `/home/w1996246/projects/aip-lenck/w1996246/spectrakv_env` |
+| 数据 / HF cache / 日志 | $SCRATCH (无备份, 60 天清理) | Killarney 自带 |
+| 共享 Llama-2-7b | 已下载, 直接指 | `/project/aip-lenck/shared/models/Llama-2-7b-hf` |
 | `SLURM --account` | RAS account | `aip-lenck` |
-| `SLURM --partition` | GPU partition | `gpubase_l40s_b1..b5` (L40S 48GB, 默认) / `gpubase_h100_b1..b5` (H100 80GB) |
+| `SLURM --partition` | GPU partition | 默认 `gpubase_h100_b1` (H100 80GB) / 备选 `gpubase_l40s_b1..b5` (L40S 48GB) |
+| modules | venv 装时和运行时必须一致 | `StdEnv/2023 gcc/12.3 arrow/21.0.0 python/3.11.5 cuda/12.6` |
 
 ## 几个必须知道的坑
 
@@ -68,7 +70,7 @@ salloc --account=aip-lenck --partition=gpubase_l40s_b1 \
 进去之后:
 ```bash
 cd ~/projects/aip-lenck/${USER}/H2O_KV/h2o_hf
-source $SCRATCH/envs/spectrakv/bin/activate
+source /home/w1996246/projects/aip-lenck/w1996246/spectrakv_env/bin/activate
 export HF_HOME=$SCRATCH/hf_cache
 export TRANSFORMERS_CACHE=$SCRATCH/hf_cache
 python test_spectra_smoke.py --verbose

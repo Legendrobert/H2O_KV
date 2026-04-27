@@ -19,7 +19,7 @@ set -euo pipefail
 
 MODEL="${1:-meta-llama/Llama-2-7b-hf}"
 HF_CACHE="${SCRATCH}/hf_cache"
-VENV_DIR="${SCRATCH}/envs/spectrakv"
+VENV_DIR="${VENV_DIR:-/home/w1996246/projects/aip-lenck/w1996246/spectrakv_env}"
 
 # 共享 Llama-2-7b 提醒
 if [[ "${MODEL}" == "meta-llama/Llama-2-7b-hf" ]]; then
@@ -39,7 +39,7 @@ export HF_HUB_DOWNLOAD_TIMEOUT=120
 
 # 加载 venv (依赖 huggingface_hub)
 module --force purge
-module load StdEnv/2023 python/3.11.5
+module load StdEnv/2023 gcc/12.3 arrow/21.0.0 python/3.11.5
 # shellcheck disable=SC1091
 source "${VENV_DIR}/bin/activate"
 

@@ -1,6 +1,6 @@
 #!/bin/bash
-# 在 CC 登录节点跑一次, 建 venv 并装 SpectraKV 依赖.
-# venv 放在 $SCRATCH 下避免吃 $HOME 配额.
+# 在 Killarney 登录节点跑一次, 建 venv 并装 SpectraKV 依赖.
+# venv 放项目空间 (有备份); 不放 $SCRATCH 因为 60 天清理会把它删掉.
 #
 # 用法:
 #   cd $PROJECT/$USER/H2O_KV/h2o_hf
@@ -8,16 +8,14 @@
 
 set -euo pipefail
 
-VENV_DIR="${SCRATCH}/envs/spectrakv"
+# venv 放项目空间, 不放 $SCRATCH (后者 60 天清理会把 venv 删掉)
+VENV_DIR="${VENV_DIR:-/home/w1996246/projects/aip-lenck/w1996246/spectrakv_env}"
 REQ_FILE="$(dirname "$0")/../../requirements_spectrakv.txt"
 
 echo "==> 加载 Killarney 模块"
-# Killarney 上 python/3.11.5 + cuda/12.6 是默认组合 (和 memory 里登记一致)
+# 和 run_lm_eval.slurm 严格一致, 否则 venv 装时和运行时 ABI 会错位
 module --force purge
-module load StdEnv/2023
-module load python/3.11.5
-module load cuda/12.6
-module load arrow/14.0.1   # datasets / pyarrow 依赖, CC 必须用模块版
+module load StdEnv/2023 gcc/12.3 arrow/21.0.0 python/3.11.5 cuda/12.6
 
 echo "==> 创建 venv: ${VENV_DIR}"
 mkdir -p "$(dirname "${VENV_DIR}")"

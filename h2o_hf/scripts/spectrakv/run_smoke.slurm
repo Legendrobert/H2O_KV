@@ -18,10 +18,10 @@ set -euo pipefail
 echo "==> SLURM job ${SLURM_JOB_ID} on $(hostname)"
 echo "==> CWD: $(pwd)"
 
-VENV_DIR="${SCRATCH}/envs/spectrakv"
+VENV_DIR="/home/w1996246/projects/aip-lenck/w1996246/spectrakv_env"
 
 module --force purge
-module load StdEnv/2023 python/3.11.5
+module load StdEnv/2023 gcc/12.3 arrow/21.0.0 python/3.11.5
 # shellcheck disable=SC1091
 source "${VENV_DIR}/bin/activate"
 

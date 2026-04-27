@@ -24,7 +24,7 @@
 #   $3 model_arch  llama / opt        (默认: llama)
 #   $4 model_type  spectra / llama / opt / gpt_neox  (默认: spectra)
 #
-# L40S 跑不下可以改 partition 到 gpubase_h100_b1 (H100 80GB).
+# 默认 partition = H100 80GB. 内存够想省卡可以换 gpubase_l40s_b1 (L40S 48GB).
 
 set -euo pipefail
 
