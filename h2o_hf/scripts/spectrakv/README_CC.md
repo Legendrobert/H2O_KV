@@ -25,12 +25,19 @@ bash scripts/spectrakv/setup_env.sh
 # 算法级 smoke (CPU 节点, ~10 秒跑完, 不耗 GPU 配额)
 sbatch scripts/spectrakv/run_smoke.slurm
 
-# 真实评测 (1 L40S, 默认跑 SpectraKV + 共享 Llama-2-7b)
-sbatch scripts/spectrakv/run_lm_eval.slurm openbookqa
+# 真实评测: 单点 (task + method, 可选 heavy/recent ratio)
+#   method = full | h2o | local | spectra
+sbatch scripts/spectrakv/run_lm_eval.slurm openbookqa h2o            # H2O 论文标配 (10/10)
+sbatch scripts/spectrakv/run_lm_eval.slurm openbookqa spectra        # SpectraKV 同预算
+sbatch scripts/spectrakv/run_lm_eval.slurm openbookqa spectra 0.05 0.05
+sbatch scripts/spectrakv/run_lm_eval.slurm openbookqa full           # 上限 baseline
 
-# 对比: 同一 task 跑 H2O baseline
-sbatch scripts/spectrakv/run_lm_eval.slurm openbookqa \
-    ~/projects/aip-lenck/shared/models/Llama-2-7b-hf llama llama
+# 批量扫: 默认 2 tasks * (1 full + 2 methods * 4 ratios) = 18 个 sbatch
+bash scripts/spectrakv/run_sweep.sh
+
+# 自定义批量: 只跑 SpectraKV, 任务限制为 openbookqa
+TASKS="openbookqa" METHODS_RATIO="spectra" METHODS_FIXED="" \
+    bash scripts/spectrakv/run_sweep.sh
 ```
 
 ## 关键路径 (Killarney)

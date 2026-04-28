@@ -11,31 +11,47 @@
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=592730248@qq.com
 
-# 真实评测: 跑 H2O lm_eval pipeline, 支持 H2O / SpectraKV 切换.
-# 默认模型 type = spectra (走 SpectraLlamaForCausalLM),
-# 要和 H2O baseline 对比就把 $4 改为 llama.
+# H2O lm_eval pipeline, 支持 full / h2o / local / spectra 四种 method 直接对照.
+# 同 task / 同 ratio / 同 prompts, 唯一差别在 attention 上的 KV 策略.
 #
-# 提交 (默认 SpectraKV + 共享 Llama-2-7b):
-#   sbatch scripts/spectrakv/run_lm_eval.slurm openbookqa
+# 用法:
+#   sbatch run_lm_eval.slurm <task> <method> [<heavy_ratio> <recent_ratio>] [<model>]
 #
-# 完整参数:
-#   $1 task        e.g. openbookqa, copa, mathqa, ...
-#   $2 model       HF id 或本地路径 (默认: 共享 Llama-2-7b)
-#   $3 model_arch  llama / opt        (默认: llama)
-#   $4 model_type  spectra / llama / opt / gpt_neox  (默认: spectra)
+# method 取值与默认 ratio (override 可传 $3 $4):
+#   full     -> 不启用 small cache (oracle, 不丢任何 KV)
+#   h2o      -> heavy=0.1 recent=0.1   (论文标配)
+#   local    -> heavy=0   recent=0.2   (纯 sliding window)
+#   spectra  -> heavy=0.1 recent=0.1   (与 H2O 同总预算, 走 SpectraKV 谱压缩)
 #
-# 默认 partition = H100 80GB. 内存够想省卡可以换 gpubase_l40s_b1 (L40S 48GB).
+# 例:
+#   sbatch run_lm_eval.slurm openbookqa h2o                 # H2O 论文标配
+#   sbatch run_lm_eval.slurm openbookqa spectra             # 同预算的 SpectraKV
+#   sbatch run_lm_eval.slurm openbookqa spectra 0.05 0.05   # 低预算 SpectraKV
+#   sbatch run_lm_eval.slurm openbookqa full                # 上限 baseline
 
 set -euo pipefail
 
-TASK="${1:?usage: sbatch run_lm_eval.slurm <task> [<model> <model_arch> <model_type>]}"
-MODEL="${2:-/project/aip-lenck/shared/models/Llama-2-7b-hf}"
-MODEL_ARCH="${3:-llama}"
-MODEL_TYPE="${4:-spectra}"
+TASK="${1:?usage: sbatch run_lm_eval.slurm <task> <method> [heavy recent] [model]}"
+METHOD="${2:?method must be one of: full | h2o | local | spectra}"
+MODEL="${5:-/project/aip-lenck/shared/models/Llama-2-7b-hf}"
 SHOTS=5
 
+case "${METHOD}" in
+    full)    DEFAULT_H=0.0 ; DEFAULT_R=0.0 ; MODEL_TYPE=llama   ; SMALL_CACHE=0 ;;
+    h2o)     DEFAULT_H=0.1 ; DEFAULT_R=0.1 ; MODEL_TYPE=llama   ; SMALL_CACHE=1 ;;
+    local)   DEFAULT_H=0.0 ; DEFAULT_R=0.2 ; MODEL_TYPE=llama   ; SMALL_CACHE=1 ;;
+    spectra) DEFAULT_H=0.1 ; DEFAULT_R=0.1 ; MODEL_TYPE=spectra ; SMALL_CACHE=1 ;;
+    *) echo "unknown method: ${METHOD} (expected full|h2o|local|spectra)" >&2; exit 2 ;;
+esac
+
+HEAVY="${3:-${DEFAULT_H}}"
+RECENT="${4:-${DEFAULT_R}}"
+MODEL_ARCH=llama
+TAG="${TASK}-${METHOD}-h${HEAVY}-r${RECENT}"
+
 echo "==> SLURM job ${SLURM_JOB_ID} on $(hostname)"
-echo "==> task=${TASK} model=${MODEL} arch=${MODEL_ARCH} type=${MODEL_TYPE} shots=${SHOTS}"
+echo "==> task=${TASK} method=${METHOD} heavy=${HEAVY} recent=${RECENT} model_type=${MODEL_TYPE} small_cache=${SMALL_CACHE}"
+echo "==> model=${MODEL}"
 echo "==> CWD: $(pwd)"
 nvidia-smi || echo "nvidia-smi 不可用 (CPU 节点?)"
 
@@ -57,7 +73,7 @@ export MODEL_NAME="${MODEL}"
 
 cd "${SLURM_SUBMIT_DIR}"
 
-OUT_DIR="${SCRATCH}/spectrakv_runs/${SLURM_JOB_ID}"
+OUT_DIR="${SCRATCH}/spectrakv_runs/${TAG}-${SLURM_JOB_ID}"
 mkdir -p "${OUT_DIR}"
 cd "${OUT_DIR}"
 
@@ -65,12 +81,13 @@ cd "${OUT_DIR}"
 ln -sf "${SLURM_SUBMIT_DIR}/generate_task_data.py" .
 ln -sf "${SLURM_SUBMIT_DIR}/run_lm_eval_harness.py" .
 ln -sf "${SLURM_SUBMIT_DIR}/evaluate_task_result.py" .
+ln -sf "${SLURM_SUBMIT_DIR}/utils_lm_eval" .
 ln -sf "${SLURM_SUBMIT_DIR}/utils_real_drop" .
 ln -sf "${SLURM_SUBMIT_DIR}/utils_spectra" .
 ln -sf "${SLURM_SUBMIT_DIR}/tasks" .
 
 INPUT="${TASK}-${SHOTS}.jsonl"
-OUTPUT="${TASK}-${SHOTS}-${MODEL_ARCH}-${MODEL_TYPE}.jsonl"
+OUTPUT="${TAG}.jsonl"
 
 echo "==> Step 1: prepare task data"
 python -u generate_task_data.py \
@@ -78,15 +95,19 @@ python -u generate_task_data.py \
     --task-name "${TASK}" \
     --num-fewshot "${SHOTS}"
 
-echo "==> Step 2: inference (model_type=${MODEL_TYPE}, h_ratio=0.02, r_ratio=0.02)"
-python -u run_lm_eval_harness.py \
-    --input-path "${INPUT}" \
-    --output-path "${OUTPUT}" \
-    --model-name "${MODEL}" \
-    --model-type "${MODEL_TYPE}" \
-    --enable_small_cache \
-    --heavy_ratio 0.02 \
-    --recent_ratio 0.02
+echo "==> Step 2: inference (method=${METHOD}, heavy=${HEAVY}, recent=${RECENT})"
+INFER_ARGS=(
+    --input-path "${INPUT}"
+    --output-path "${OUTPUT}"
+    --model-name "${MODEL}"
+    --model-type "${MODEL_TYPE}"
+    --heavy_ratio "${HEAVY}"
+    --recent_ratio "${RECENT}"
+)
+if [[ "${SMALL_CACHE}" == "1" ]]; then
+    INFER_ARGS+=( --enable_small_cache )
+fi
+python -u run_lm_eval_harness.py "${INFER_ARGS[@]}"
 
 echo "==> Step 3: evaluate"
 python -u evaluate_task_result.py \
