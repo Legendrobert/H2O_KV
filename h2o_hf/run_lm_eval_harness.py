@@ -42,6 +42,11 @@ if __name__ == '__main__':
                         help="SpectraKV: 开头强制保留的 sink token 数")
     parser.add_argument("--jl_dim_multiplier", type=int, default=4,
                         help="SpectraKV: JL sketch 维度 = jl_dim_multiplier * head_dim")
+    parser.add_argument("--selection_mode", type=str, default="leverage",
+                        choices=["leverage", "attention_sum"],
+                        help="SpectraKV: middle 段 top-r 的选择信号. "
+                             "'leverage' = 默认 (K 几何), "
+                             "'attention_sum' = H2O oracle ablation (Σ_q softmax(QK^T))")
     args = parser.parse_args()
 
     input_path = args.input_path
@@ -61,6 +66,7 @@ if __name__ == '__main__':
             # 解成绝对的 hh_size / recent_size.
             config.sink_size = args.sink_size
             config.jl_dim_multiplier = args.jl_dim_multiplier
+            config.selection_mode = args.selection_mode
         checkpoint = copy.deepcopy(model.state_dict())
         model = ENABLE_Heavy_Hitter_FUNCTIONS[args.model_type](model, config)
         model.load_state_dict(checkpoint)

@@ -89,6 +89,8 @@ class SpectraKVCache_LayerWise:
         └── recent_size : 强制保留的尾部窗口
     """
 
+    SUPPORTED_SELECTION_MODES = ("leverage", "attention_sum")
+
     def __init__(
         self,
         heavy_ratio: Optional[float] = None,
@@ -98,6 +100,7 @@ class SpectraKVCache_LayerWise:
         sink_size: int = 4,
         jl_dim_multiplier: int = 4,
         reg_lambda: float = 1e-3,
+        selection_mode: str = "leverage",
         k_seq_dim: int = 2,
         v_seq_dim: int = 2,
     ):
@@ -110,19 +113,31 @@ class SpectraKVCache_LayerWise:
               hh_size + recent_size, 静态预算
 
         Args:
-            heavy_ratio:    leverage top-r 的 budget 占当前 prompt 长度的比例
+            heavy_ratio:    middle 段 top-r 的 budget 占当前 prompt 长度的比例
             recent_ratio:   recent 窗口占当前 prompt 长度的比例
             hh_size:        显式绝对值, 给了就覆盖 heavy_ratio
             recent_size:    显式绝对值, 给了就覆盖 recent_ratio
             sink_size:      开头强制保留的 sink token 数 (StreamingLLM, 一般 4)
             jl_dim_multiplier: JL sketch 维度 m = jl_dim_multiplier * head_dim
             reg_lambda:     R = (SK)^T(SK) 求逆前加的 λI 正则
+            selection_mode: middle 段 top-r 的选择信号:
+                              "leverage"      = SpectraKV 默认, 由 K 的几何重要性决定
+                              "attention_sum" = H2O 风格 oracle, 由 Σ_q softmax(QK^T)[q,k] 决定.
+                                                沿用 SpectraKV 框架 (sink + middle topk + tail recent
+                                                + per-query rolling band, one-shot 压缩), 只是把"中
+                                                间段重要性分数"换成跟 H2O 一致的信号. 用来 ablate
+                                                选择信号本身是不是 H2O 比 SpectraKV 强的根因.
             k_seq_dim / v_seq_dim: K/V 张量里 "序列长度" 所在的维度
         """
         if hh_size is None and heavy_ratio is None:
             raise ValueError("SpectraKVCache 至少要指定 heavy_ratio 或 hh_size 中的一个")
         if recent_size is None and recent_ratio is None:
             raise ValueError("SpectraKVCache 至少要指定 recent_ratio 或 recent_size 中的一个")
+        if selection_mode not in self.SUPPORTED_SELECTION_MODES:
+            raise ValueError(
+                f"unknown selection_mode={selection_mode!r}, "
+                f"expected one of {self.SUPPORTED_SELECTION_MODES}"
+            )
 
         # 绝对模式优先
         self.hh_size_abs = hh_size
@@ -131,15 +146,17 @@ class SpectraKVCache_LayerWise:
         self.recent_ratio = recent_ratio
         self.sink_size = sink_size
 
+        self.selection_mode = selection_mode
+
         if hh_size is not None and recent_size is not None:
             print(
                 f"SpectraKVCache-LayerWise (absolute): sink={sink_size}, "
-                f"hh(top-r)={hh_size}, recent={recent_size}"
+                f"hh(top-r)={hh_size}, recent={recent_size}, sel={selection_mode}"
             )
         else:
             print(
                 f"SpectraKVCache-LayerWise (ratio): sink={sink_size}, "
-                f"h_ratio={heavy_ratio}, r_ratio={recent_ratio}  "
+                f"h_ratio={heavy_ratio}, r_ratio={recent_ratio}, sel={selection_mode}  "
                 f"(per-prompt: budget = ratio × seq_len)"
             )
 
@@ -294,24 +311,18 @@ class SpectraKVCache_LayerWise:
     # 选 keep 行 (sink + top-r + recent), 缓存索引供 mask 和 gather 共用
     # ----------------------------------------------------------------------
     @torch.no_grad()
-    def _compute_keep_idx(self, K: torch.Tensor) -> torch.Tensor:
+    def _compute_keep_idx_from_scores(
+        self, scores: torch.Tensor, num_heads: int, N: int
+    ) -> torch.Tensor:
         """
-        算 leverage score, 选 sink + top-r(中间段) + recent, 返回排好序的索引.
-        缓存到 self._keep_idx, 同一份索引被 attention mask 和 cache gather 共享.
+        Signal-agnostic core: 给 (num_heads, N) 的"重要性分数", 选 sink + top-r(middle) + recent
+        拼成 keep_idx, 排好序后缓存返回. score 越大越重要.
 
-        K shape: (1, num_kv_heads, N, head_dim)
-        return : (num_kv_heads, L) long, L 通常 = cache_size
+        signal 怎么算 (leverage / attention_sum / etc.) 由调用方决定. 这个函数保证两条路
+        的下游 (sink / recent / sort / cache) 完全一致, 所以 ablation 是干净的.
         """
-        if self._keep_idx is not None:
-            return self._keep_idx
-
-        bsz, num_heads, N, d = K.shape
-        device = K.device
-
-        # per-prompt 动态预算: ratio × N 或绝对值
+        device = scores.device
         hh_size, recent_size = self._resolve_sizes(N)
-
-        leverage = self._compute_leverage_scores(K)              # (H, N)
 
         middle_start = self.sink_size
         middle_end = N - recent_size
@@ -319,8 +330,8 @@ class SpectraKVCache_LayerWise:
         k_middle = min(hh_size, middle_len)
 
         if k_middle > 0:
-            middle_leverage = leverage[:, middle_start:middle_end]
-            _, topk_local = torch.topk(middle_leverage, k=k_middle, dim=-1, largest=True)
+            middle_scores = scores[:, middle_start:middle_end]
+            _, topk_local = torch.topk(middle_scores, k=k_middle, dim=-1, largest=True)
             topk_global = topk_local + middle_start              # (H, k_middle)
         else:
             topk_global = torch.empty(num_heads, 0, dtype=torch.long, device=device)
@@ -342,6 +353,59 @@ class SpectraKVCache_LayerWise:
 
         self._keep_idx = keep_idx
         return keep_idx
+
+    @torch.no_grad()
+    def _compute_keep_idx(self, K: torch.Tensor) -> torch.Tensor:
+        """
+        Leverage 模式入口 (SpectraKV 默认): 用 JL-approx 的 leverage score 当重要性分数.
+        K shape: (1, num_kv_heads, N, head_dim)
+        return : (num_kv_heads, L) long
+        """
+        if self._keep_idx is not None:
+            return self._keep_idx
+        bsz, num_heads, N, d = K.shape
+        leverage = self._compute_leverage_scores(K)              # (H, N)
+        return self._compute_keep_idx_from_scores(leverage, num_heads, N)
+
+    @torch.no_grad()
+    def _compute_keep_idx_from_attn(
+        self,
+        attn_probs: torch.Tensor,
+        num_kv_heads: int,
+        num_kv_groups: int,
+    ) -> torch.Tensor:
+        """
+        Attention-sum 模式入口 (oracle, ablate 选择信号):
+            score[h_kv, k] = Σ_g Σ_q attn_probs[1, h_kv*groups+g, q, k]
+        即把同一组 GQA query head 的 attention 求和, 当成 KV head 的重要性.
+        其余流程 (sink + middle topk + tail recent, sort, cache) 走通用核心,
+        和 leverage 模式严格对齐, 干净 ablation.
+
+        attn_probs: (bsz=1, num_heads, q_len, kv_seq_len), 已经 softmax (post-causal-mask).
+        Llama-2-7b 没有 GQA (num_heads == num_kv_heads, groups=1), 但保留路径以兼容 7b 之外.
+        """
+        if self._keep_idx is not None:
+            return self._keep_idx
+
+        bsz, num_heads, q_len, N = attn_probs.shape
+        assert bsz == 1, "SpectraKV 目前只支持 bsz=1"
+        assert num_heads == num_kv_heads * num_kv_groups, (
+            f"num_heads={num_heads} 不等于 num_kv_heads*num_kv_groups="
+            f"{num_kv_heads}*{num_kv_groups}"
+        )
+
+        # (1, num_heads, q_len, N) -> (1, num_heads, N): 跨 query 求和
+        score_per_qhead = attn_probs.sum(dim=-2).to(torch.float32)
+        # GQA 归约到 KV head: (num_kv_heads, groups, N) -> (num_kv_heads, N)
+        score_per_kvhead = (
+            score_per_qhead.view(bsz, num_kv_heads, num_kv_groups, N)
+            .sum(dim=2)
+            .squeeze(0)
+        )
+
+        return self._compute_keep_idx_from_scores(
+            score_per_kvhead, num_kv_heads, N
+        )
 
     # ----------------------------------------------------------------------
     # 用缓存好的 keep_idx gather 出压缩的 K/V (decode 复用用)
@@ -415,6 +479,7 @@ class SpectraLlamaAttention(nn.Module):
             sink_size=getattr(config, "sink_size", 4),
             jl_dim_multiplier=getattr(config, "jl_dim_multiplier", 4),
             reg_lambda=getattr(config, "reg_lambda", 1e-3),
+            selection_mode=getattr(config, "selection_mode", "leverage"),
             k_seq_dim=2,
             v_seq_dim=2,
         )
@@ -519,6 +584,31 @@ class SpectraLlamaAttention(nn.Module):
         # use_cache=True 时, 这是"当前步看到的完整 KV", 稍后喂给 SpectraKV 压缩器
         past_key_value = (key_states, value_states) if use_cache else None
 
+        # ---- GQA: 把 kv_head 重复到 num_heads ----
+        key_states_rep = repeat_kv(key_states, self.num_key_value_groups)
+        value_states_rep = repeat_kv(value_states, self.num_key_value_groups)
+
+        # ---- QK^T / sqrt(d) + causal mask, 还没加 spec_mask ----
+        # 提前到这里是为了让 attention_sum (oracle) 选择信号能拿到 post-causal probs.
+        # leverage 模式下不会用到这里的 softmax, 多算一次开销可忽略.
+        attn_weights = torch.matmul(query_states, key_states_rep.transpose(2, 3)) / math.sqrt(
+            self.head_dim
+        )
+
+        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+            raise ValueError(
+                f"Attention weights size mismatch: "
+                f"expected {(bsz, self.num_heads, q_len, kv_seq_len)}, got {attn_weights.size()}"
+            )
+
+        if attention_mask is not None:
+            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+                raise ValueError(
+                    f"Attention mask size mismatch: "
+                    f"expected {(bsz, 1, q_len, kv_seq_len)}, got {attention_mask.size()}"
+                )
+            attn_weights = attn_weights + attention_mask
+
         # ---- 计算 spectral keep mask, 让压缩对当前 forward 的 logprobs 也生效 ----
         # 单次 forward 评测 (lm_eval) 里, 单纯压缩 past_key_value 不会影响这一步 attention
         # 的输出, 必须在 softmax 之前把非 keep 位置 mask 掉.
@@ -529,9 +619,23 @@ class SpectraLlamaAttention(nn.Module):
         # 早期 query 不再因为全局 keep_idx 全在中后段而只能看 sink, 单调性才能恢复.
         spec_mask = None
         if not self.kv_cache.compressed and kv_seq_len > self.kv_cache._resolve_cache_size(kv_seq_len):
-            keep_idx = self.kv_cache._compute_keep_idx(key_states)              # (num_kv_heads, L)
+            if self.kv_cache.selection_mode == "attention_sum":
+                # Oracle (H2O 风格): 用 post-causal-mask 的 softmax 求 sum_q 当 score.
+                # 注意这次 softmax 只是为了选 keep_idx, 不是最终的 attn 输出.
+                with torch.no_grad():
+                    ref_probs = nn.functional.softmax(
+                        attn_weights, dim=-1, dtype=torch.float32
+                    )
+                keep_idx = self.kv_cache._compute_keep_idx_from_attn(
+                    ref_probs,
+                    self.num_key_value_heads,
+                    self.num_key_value_groups,
+                )                                                                # (num_kv_heads, L)
+            else:
+                # 默认 SpectraKV: K 上算 leverage score
+                keep_idx = self.kv_cache._compute_keep_idx(key_states)           # (num_kv_heads, L)
 
-            # 全局 keep set: sink + leverage top-r + tail recent. 跨 q 广播.
+            # 全局 keep set: sink + (leverage|attn_sum) top-r + tail recent. 跨 q 广播.
             keep_bool = torch.zeros(
                 self.num_key_value_heads, kv_seq_len,
                 dtype=torch.bool, device=key_states.device,
@@ -555,29 +659,6 @@ class SpectraLlamaAttention(nn.Module):
                 dtype=query_states.dtype, device=key_states.device,
             )
             spec_mask.masked_fill_(~final_keep, mask_min)
-
-        # ---- GQA: 把 kv_head 重复到 num_heads ----
-        key_states_rep = repeat_kv(key_states, self.num_key_value_groups)
-        value_states_rep = repeat_kv(value_states, self.num_key_value_groups)
-
-        # ---- 标准 scaled-dot-product attention ----
-        attn_weights = torch.matmul(query_states, key_states_rep.transpose(2, 3)) / math.sqrt(
-            self.head_dim
-        )
-
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights size mismatch: "
-                f"expected {(bsz, self.num_heads, q_len, kv_seq_len)}, got {attn_weights.size()}"
-            )
-
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask size mismatch: "
-                    f"expected {(bsz, 1, q_len, kv_seq_len)}, got {attention_mask.size()}"
-                )
-            attn_weights = attn_weights + attention_mask
 
         # spectral keep mask: 把不被保留的 token 推到 -inf, softmax 后权重为 0
         if spec_mask is not None:
@@ -637,10 +718,12 @@ def _resolve_spectra_budgets(config):
     """
     SpectraLlamaAttention 直接消费 config.heavy_ratio / config.recent_ratio (per-prompt
     动态 budget, 跟 H2O 语义对齐), 或 config.hh_size / config.recent_size (绝对值, 优先).
-    本函数只补 sink_size 默认值, 不再把 ratio 静态展开成绝对值.
+    本函数只补默认值 (sink_size, selection_mode), 不再把 ratio 静态展开成绝对值.
     """
     if not hasattr(config, "sink_size") or config.sink_size is None:
         config.sink_size = 4
+    if not hasattr(config, "selection_mode") or config.selection_mode is None:
+        config.selection_mode = "leverage"
     return config
 
 
