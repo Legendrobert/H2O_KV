@@ -13,7 +13,13 @@ cd H2O_KV/h2o_hf
 # 2. 建 venv 装依赖 (只需做一次)
 bash scripts/spectrakv/setup_env.sh
 
-# 3. (可选) Llama-2-7b 已经在共享目录, 不需要下载:
+# 3. 预下评测数据集到 $HF_HOME (登录节点跑, compute node 无外网)
+#    默认 openbookqa + copa + piqa + winogrande, 覆盖跨任务对比所需
+bash scripts/spectrakv/prepare_data.sh
+#    自定义任务集:
+# TASKS="copa piqa rte" bash scripts/spectrakv/prepare_data.sh
+
+# 4. (可选) Llama-2-7b 已经在共享目录, 不需要下载:
 #      ~/projects/aip-lenck/shared/models/Llama-2-7b-hf
 #    只有要换别的模型才跑这个:
 # bash scripts/spectrakv/download_model.sh huggyllama/llama-7b
