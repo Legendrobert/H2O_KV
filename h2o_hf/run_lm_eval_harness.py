@@ -43,10 +43,13 @@ if __name__ == '__main__':
     parser.add_argument("--jl_dim_multiplier", type=int, default=4,
                         help="SpectraKV: JL sketch 维度 = jl_dim_multiplier * head_dim")
     parser.add_argument("--selection_mode", type=str, default="leverage",
-                        choices=["leverage", "attention_sum"],
+                        choices=["leverage", "v_leverage", "attention_sum"],
                         help="SpectraKV: middle 段 top-r 的选择信号. "
-                             "'leverage' = 默认 (K 几何), "
+                             "'leverage' = K 几何 (默认), "
+                             "'v_leverage' = V 几何 (输出贡献), "
                              "'attention_sum' = H2O oracle ablation (Σ_q softmax(QK^T))")
+    parser.add_argument("--jl_seed", type=int, default=42,
+                        help="SpectraKV: JL sketch 随机种子, 固定后 run-to-run 完全可复现")
     args = parser.parse_args()
 
     input_path = args.input_path
@@ -67,6 +70,7 @@ if __name__ == '__main__':
             config.sink_size = args.sink_size
             config.jl_dim_multiplier = args.jl_dim_multiplier
             config.selection_mode = args.selection_mode
+            config.jl_seed = args.jl_seed
         checkpoint = copy.deepcopy(model.state_dict())
         model = ENABLE_Heavy_Hitter_FUNCTIONS[args.model_type](model, config)
         model.load_state_dict(checkpoint)

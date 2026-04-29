@@ -89,7 +89,7 @@ class SpectraKVCache_LayerWise:
         └── recent_size : 强制保留的尾部窗口
     """
 
-    SUPPORTED_SELECTION_MODES = ("leverage", "attention_sum")
+    SUPPORTED_SELECTION_MODES = ("leverage", "v_leverage", "attention_sum")
 
     def __init__(
         self,
@@ -101,6 +101,7 @@ class SpectraKVCache_LayerWise:
         jl_dim_multiplier: int = 4,
         reg_lambda: float = 1e-3,
         selection_mode: str = "leverage",
+        jl_seed: int = 42,
         k_seq_dim: int = 2,
         v_seq_dim: int = 2,
     ):
@@ -121,12 +122,16 @@ class SpectraKVCache_LayerWise:
             jl_dim_multiplier: JL sketch 维度 m = jl_dim_multiplier * head_dim
             reg_lambda:     R = (SK)^T(SK) 求逆前加的 λI 正则
             selection_mode: middle 段 top-r 的选择信号:
-                              "leverage"      = SpectraKV 默认, 由 K 的几何重要性决定
+                              "leverage"      = SpectraKV 默认, K 的 row leverage score
+                              "v_leverage"    = V 的 row leverage score. 注意力输出是 softmax(·)V,
+                                                V 的 row space 才直接决定输出, 理论上比 K-leverage
+                                                更接近"对输出贡献大"的语义.
                               "attention_sum" = H2O 风格 oracle, 由 Σ_q softmax(QK^T)[q,k] 决定.
                                                 沿用 SpectraKV 框架 (sink + middle topk + tail recent
                                                 + per-query rolling band, one-shot 压缩), 只是把"中
                                                 间段重要性分数"换成跟 H2O 一致的信号. 用来 ablate
                                                 选择信号本身是不是 H2O 比 SpectraKV 强的根因.
+            jl_seed:        JL sketch 用的随机种子. 固定后 run-to-run 完全可复现.
             k_seq_dim / v_seq_dim: K/V 张量里 "序列长度" 所在的维度
         """
         if hh_size is None and heavy_ratio is None:
@@ -162,6 +167,11 @@ class SpectraKVCache_LayerWise:
 
         self.jl_dim_multiplier = jl_dim_multiplier
         self.reg_lambda = reg_lambda
+        self.jl_seed = jl_seed
+        # Lazy-init: 第一次用到 leverage 路径时按 K.device 建一个 fixed-seed Generator.
+        # 同一个 generator 跨 layer / 跨 sample 复用, 状态会顺延, 但只要 jl_seed
+        # 和调用顺序固定, run-to-run 就完全可复现.
+        self._jl_gen = None
 
         self.k_seq_dim = k_seq_dim
         self.v_seq_dim = v_seq_dim
@@ -248,46 +258,56 @@ class SpectraKVCache_LayerWise:
     # JL sketch 近似 leverage score
     # ----------------------------------------------------------------------
     @torch.no_grad()
-    def _compute_leverage_scores(self, K: torch.Tensor) -> torch.Tensor:
+    def _compute_leverage_scores(self, M: torch.Tensor) -> torch.Tensor:
         """
-        对 K 每一行计算近似 leverage score.
+        对 M 每一行计算近似 leverage score. M 可以是 K (默认) 或 V (v_leverage 模式).
 
-        数学:  l_i = K_i (K^T K)^{-1} K_i^T
-        JL 近似: 用 R = (SK)^T(SK) + λI 替代 K^T K, 其中 S 是随机投影矩阵.
+        数学:  l_i = M_i (M^T M)^{-1} M_i^T
+        JL 近似: 用 R = (SM)^T(SM) + λI 替代 M^T M, 其中 S 是随机投影矩阵.
         复杂度 O(N d log d + d^3) 每头.
 
         Args:
-            K: (bsz=1, num_heads, N, d), 可能是 fp16
+            M: (bsz=1, num_heads, N, d), 可能是 fp16
         Returns:
             leverage: (num_heads, N), fp32
         """
-        bsz, num_heads, N, d = K.shape
+        bsz, num_heads, N, d = M.shape
         assert bsz == 1, "SpectraKV 目前只支持 bsz=1 (和 H2O 保持一致)"
 
         # 数值计算统一在 fp32, 避免 fp16 下 R 的求逆不稳
-        K_f32 = K.squeeze(0).to(torch.float32)              # (H, N, d)
-        device = K.device
+        M_f32 = M.squeeze(0).to(torch.float32)              # (H, N, d)
+        device = M.device
 
         # JL 维度 m. 理论上 m = Θ(d log d) 就足够 subspace embedding.
         # 实际 4*d 比较稳健, 同时不超过 N 否则浪费.
         m = min(self.jl_dim_multiplier * d, N)
 
-        # 随机投影矩阵 S ~ N(0, 1/m). 所有 head 共享同一个 S:
-        # leverage 计算本身是 per-head 的 (R 和 l_i 都是 per-head), 共享 S 不影响
-        # 单头的估计质量, 同时显著省显存 (省 num_heads 倍).
-        S = torch.randn(m, N, device=device, dtype=torch.float32) / math.sqrt(m)
+        # 随机投影矩阵 S ~ N(0, 1/m). 用固定 seed 的 Generator 保证 run-to-run 可复现.
+        # 同一个 generator 在所有 layer / sample 之间状态顺延, 各自拿到不同 sketch,
+        # 但只要 jl_seed + 调用顺序固定, 整体输出就完全可复现.
+        if self._jl_gen is None or self._jl_gen.device != device:
+            self._jl_gen = torch.Generator(device=device).manual_seed(self.jl_seed)
+        S = (
+            torch.randn(
+                m, N,
+                generator=self._jl_gen,
+                device=device,
+                dtype=torch.float32,
+            )
+            / math.sqrt(m)
+        )
 
-        # SK: (1, m, N) @ (H, N, d) -> (H, m, d). 广播省去显式复制.
-        SK = torch.matmul(S.unsqueeze(0), K_f32)
+        # SM: (1, m, N) @ (H, N, d) -> (H, m, d). 广播省去显式复制.
+        SM = torch.matmul(S.unsqueeze(0), M_f32)
 
-        # R = SK^T SK + λI: (H, d, d)
-        R = torch.matmul(SK.transpose(1, 2), SK)
+        # R = SM^T SM + λI: (H, d, d)
+        R = torch.matmul(SM.transpose(1, 2), SM)
         eye = torch.eye(d, device=device, dtype=torch.float32).unsqueeze(0)
 
-        # 自适应 λ: 跟 R 的对角平均同量级, 避免 K 数值大时 reg_lambda 失效.
-        # 某些 Llama head (attention sink) K 行范数极大, R 量级到 1e6+, 固定的
+        # 自适应 λ: 跟 R 的对角平均同量级, 避免 M 数值大时 reg_lambda 失效.
+        # 某些 Llama head (attention sink) row 范数极大, R 量级到 1e6+, 固定的
         # reg_lambda=1e-3 起不到正则化作用, fp32 下噪声就能让 Cholesky 挂.
-        # 这里把 λ 钉到 R 自己的 scale 的某个比例, 不管 K 多大都有效.
+        # 这里把 λ 钉到 R 自己的 scale 的某个比例, 不管 M 多大都有效.
         diag_mean = R.diagonal(dim1=-2, dim2=-1).mean(dim=-1, keepdim=True).unsqueeze(-1)  # (H, 1, 1)
         lam = (self.reg_lambda * diag_mean).clamp(min=1e-6)
         R = R + lam * eye
@@ -299,11 +319,11 @@ class SpectraKVCache_LayerWise:
         except torch._C._LinAlgError:
             R_inv = torch.linalg.pinv(R)
 
-        # leverage_i = K_i R^{-1} K_i^T
-        # 先 K R^{-1}: (H, N, d)
-        KR_inv = torch.matmul(K_f32, R_inv)
+        # leverage_i = M_i R^{-1} M_i^T
+        # 先 M R^{-1}: (H, N, d)
+        MR_inv = torch.matmul(M_f32, R_inv)
         # 然后逐行内积: (H, N, d) * (H, N, d) 按最后一维求和 -> (H, N)
-        leverage = (K_f32 * KR_inv).sum(dim=-1)
+        leverage = (M_f32 * MR_inv).sum(dim=-1)
 
         return leverage
 
@@ -355,16 +375,17 @@ class SpectraKVCache_LayerWise:
         return keep_idx
 
     @torch.no_grad()
-    def _compute_keep_idx(self, K: torch.Tensor) -> torch.Tensor:
+    def _compute_keep_idx_leverage(self, M: torch.Tensor) -> torch.Tensor:
         """
-        Leverage 模式入口 (SpectraKV 默认): 用 JL-approx 的 leverage score 当重要性分数.
-        K shape: (1, num_kv_heads, N, head_dim)
+        Leverage 模式入口: 用 JL-approx 的 row leverage score 当重要性分数.
+        M 可以是 K (selection_mode='leverage') 或 V (selection_mode='v_leverage').
+        M shape: (1, num_kv_heads, N, head_dim)
         return : (num_kv_heads, L) long
         """
         if self._keep_idx is not None:
             return self._keep_idx
-        bsz, num_heads, N, d = K.shape
-        leverage = self._compute_leverage_scores(K)              # (H, N)
+        bsz, num_heads, N, d = M.shape
+        leverage = self._compute_leverage_scores(M)              # (H, N)
         return self._compute_keep_idx_from_scores(leverage, num_heads, N)
 
     @torch.no_grad()
@@ -414,7 +435,7 @@ class SpectraKVCache_LayerWise:
     def _compress(self, K: torch.Tensor, V: torch.Tensor):
         """
         一次性压缩:
-          1. _compute_keep_idx (若已缓存直接复用, 跟 attention mask 同源)
+          1. _compute_keep_idx_leverage (若已缓存直接复用, 跟 attention mask 同源)
           2. 按原位置排序后 gather K/V (保留 RoPE 内嵌的位置语义)
 
         K, V shape: (1, num_kv_heads, N, head_dim)
@@ -422,7 +443,7 @@ class SpectraKVCache_LayerWise:
         """
         bsz, num_heads, N, d = K.shape
 
-        keep_idx = self._compute_keep_idx(K)                     # (H, L)
+        keep_idx = self._compute_keep_idx_leverage(K)            # (H, L)
         L = keep_idx.size(-1)
 
         idx_expand = keep_idx.unsqueeze(0).unsqueeze(-1).expand(bsz, num_heads, L, d)
@@ -480,6 +501,7 @@ class SpectraLlamaAttention(nn.Module):
             jl_dim_multiplier=getattr(config, "jl_dim_multiplier", 4),
             reg_lambda=getattr(config, "reg_lambda", 1e-3),
             selection_mode=getattr(config, "selection_mode", "leverage"),
+            jl_seed=getattr(config, "jl_seed", 42),
             k_seq_dim=2,
             v_seq_dim=2,
         )
@@ -619,7 +641,8 @@ class SpectraLlamaAttention(nn.Module):
         # 早期 query 不再因为全局 keep_idx 全在中后段而只能看 sink, 单调性才能恢复.
         spec_mask = None
         if not self.kv_cache.compressed and kv_seq_len > self.kv_cache._resolve_cache_size(kv_seq_len):
-            if self.kv_cache.selection_mode == "attention_sum":
+            mode = self.kv_cache.selection_mode
+            if mode == "attention_sum":
                 # Oracle (H2O 风格): 用 post-causal-mask 的 softmax 求 sum_q 当 score.
                 # 注意这次 softmax 只是为了选 keep_idx, 不是最终的 attn 输出.
                 with torch.no_grad():
@@ -631,9 +654,12 @@ class SpectraLlamaAttention(nn.Module):
                     self.num_key_value_heads,
                     self.num_key_value_groups,
                 )                                                                # (num_kv_heads, L)
+            elif mode == "v_leverage":
+                # V 的 row leverage: 注意力输出是 softmax(·)V, 直接挑对输出贡献大的 token.
+                keep_idx = self.kv_cache._compute_keep_idx_leverage(value_states)
             else:
-                # 默认 SpectraKV: K 上算 leverage score
-                keep_idx = self.kv_cache._compute_keep_idx(key_states)           # (num_kv_heads, L)
+                # 默认 SpectraKV: K 的 row leverage
+                keep_idx = self.kv_cache._compute_keep_idx_leverage(key_states)  # (num_kv_heads, L)
 
             # 全局 keep set: sink + (leverage|attn_sum) top-r + tail recent. 跨 q 广播.
             keep_bool = torch.zeros(
@@ -724,6 +750,8 @@ def _resolve_spectra_budgets(config):
         config.sink_size = 4
     if not hasattr(config, "selection_mode") or config.selection_mode is None:
         config.selection_mode = "leverage"
+    if not hasattr(config, "jl_seed") or config.jl_seed is None:
+        config.jl_seed = 42
     return config
 
 

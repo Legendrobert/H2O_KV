@@ -26,22 +26,19 @@ bash scripts/spectrakv/setup_env.sh
 sbatch scripts/spectrakv/run_smoke.slurm
 
 # 真实评测: 单点 (task + method, 可选 heavy/recent ratio)
-#   method = full | h2o | local | spectra | spectra_oracle
+#   method = full | h2o | local | spectra | spectra_v | spectra_oracle
 sbatch scripts/spectrakv/run_lm_eval.slurm openbookqa h2o              # H2O 论文标配 (10/10)
-sbatch scripts/spectrakv/run_lm_eval.slurm openbookqa spectra          # SpectraKV 同预算
-sbatch scripts/spectrakv/run_lm_eval.slurm openbookqa spectra_oracle   # ablation: SpectraKV 框架 + H2O 选择信号
+sbatch scripts/spectrakv/run_lm_eval.slurm openbookqa spectra          # SpectraKV (K-leverage)
+sbatch scripts/spectrakv/run_lm_eval.slurm openbookqa spectra_v        # SpectraKV (V-leverage)
+sbatch scripts/spectrakv/run_lm_eval.slurm openbookqa spectra_oracle   # 信号上限 (H2O attention-sum)
 sbatch scripts/spectrakv/run_lm_eval.slurm openbookqa spectra 0.05 0.05
 sbatch scripts/spectrakv/run_lm_eval.slurm openbookqa full             # 上限 baseline
 
-# 批量扫: 默认 2 tasks * (1 full + 3 methods * 4 ratios) = 26 个 sbatch
+# 批量扫: 默认 2 tasks * (1 full + 4 methods * 4 ratios) = 34 个 sbatch
 bash scripts/spectrakv/run_sweep.sh
 
-# 自定义批量: 只跑 SpectraKV, 任务限制为 openbookqa
-TASKS="openbookqa" METHODS_RATIO="spectra" METHODS_FIXED="" \
-    bash scripts/spectrakv/run_sweep.sh
-
-# 只跑 ablation 对照 (spectra vs spectra_oracle, 同预算同框架)
-METHODS_RATIO="spectra spectra_oracle" METHODS_FIXED="" \
+# 只跑信号 ablation (4 个 spectra 变体 + h2o, 同预算同框架)
+METHODS_RATIO="h2o spectra spectra_v spectra_oracle" METHODS_FIXED="" \
     bash scripts/spectrakv/run_sweep.sh
 ```
 

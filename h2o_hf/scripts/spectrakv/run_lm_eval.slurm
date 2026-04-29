@@ -11,7 +11,7 @@
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=592730248@qq.com
 
-# H2O lm_eval pipeline, 支持 full / h2o / local / spectra / spectra_oracle 五种 method.
+# H2O lm_eval pipeline, 支持 6 种 method 直接对照.
 # 同 task / 同 ratio / 同 prompts, 唯一差别在 attention 上的 KV 策略.
 #
 # 用法:
@@ -19,23 +19,24 @@
 #
 # method 取值与默认 ratio (override 可传 $3 $4):
 #   full           -> 不启用 small cache (oracle, 不丢任何 KV)
-#   h2o            -> heavy=0.1 recent=0.1   (论文标配)
-#   local          -> heavy=0   recent=0.2   (纯 sliding window)
-#   spectra        -> heavy=0.1 recent=0.1   (与 H2O 同总预算, leverage 选择)
-#   spectra_oracle -> heavy=0.1 recent=0.1   (SpectraKV 框架 + H2O attention-sum 选择信号,
-#                                              用来 ablate 选择信号 vs 框架谁是 gap 来源)
+#   h2o            -> heavy=0.1 recent=0.1  (论文标配)
+#   local          -> heavy=0   recent=0.2  (纯 sliding window)
+#   spectra        -> heavy=0.1 recent=0.1  (SpectraKV 框架 + K-leverage 选择)
+#   spectra_v      -> heavy=0.1 recent=0.1  (SpectraKV 框架 + V-leverage 选择, V 对输出贡献)
+#   spectra_oracle -> heavy=0.1 recent=0.1  (SpectraKV 框架 + H2O attention-sum, 信号上限 ablation)
 #
 # 例:
 #   sbatch run_lm_eval.slurm openbookqa h2o                 # H2O 论文标配
-#   sbatch run_lm_eval.slurm openbookqa spectra             # 同预算的 SpectraKV
-#   sbatch run_lm_eval.slurm openbookqa spectra_oracle      # ablation: 框架不变,选择信号换 H2O
+#   sbatch run_lm_eval.slurm openbookqa spectra             # 默认 SpectraKV
+#   sbatch run_lm_eval.slurm openbookqa spectra_v           # V-leverage 变体
+#   sbatch run_lm_eval.slurm openbookqa spectra_oracle      # 信号上限对照
 #   sbatch run_lm_eval.slurm openbookqa spectra 0.05 0.05   # 低预算 SpectraKV
 #   sbatch run_lm_eval.slurm openbookqa full                # 上限 baseline
 
 set -euo pipefail
 
 TASK="${1:?usage: sbatch run_lm_eval.slurm <task> <method> [heavy recent] [model]}"
-METHOD="${2:?method must be one of: full | h2o | local | spectra | spectra_oracle}"
+METHOD="${2:?method: full | h2o | local | spectra | spectra_v | spectra_oracle}"
 MODEL="${5:-/project/aip-lenck/shared/models/Llama-2-7b-hf}"
 SHOTS=5
 
@@ -44,8 +45,9 @@ case "${METHOD}" in
     h2o)            DEFAULT_H=0.1 ; DEFAULT_R=0.1 ; MODEL_TYPE=llama   ; SMALL_CACHE=1 ; SEL_MODE="" ;;
     local)          DEFAULT_H=0.0 ; DEFAULT_R=0.2 ; MODEL_TYPE=llama   ; SMALL_CACHE=1 ; SEL_MODE="" ;;
     spectra)        DEFAULT_H=0.1 ; DEFAULT_R=0.1 ; MODEL_TYPE=spectra ; SMALL_CACHE=1 ; SEL_MODE="leverage" ;;
+    spectra_v)      DEFAULT_H=0.1 ; DEFAULT_R=0.1 ; MODEL_TYPE=spectra ; SMALL_CACHE=1 ; SEL_MODE="v_leverage" ;;
     spectra_oracle) DEFAULT_H=0.1 ; DEFAULT_R=0.1 ; MODEL_TYPE=spectra ; SMALL_CACHE=1 ; SEL_MODE="attention_sum" ;;
-    *) echo "unknown method: ${METHOD} (expected full|h2o|local|spectra|spectra_oracle)" >&2; exit 2 ;;
+    *) echo "unknown method: ${METHOD}" >&2; exit 2 ;;
 esac
 
 HEAVY="${3:-${DEFAULT_H}}"
